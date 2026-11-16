@@ -17,6 +17,47 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
+function generateCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+async function sendVerificationEmail(toEmail, code) {
+  const apiKey = process.env.BREVO_API_KEY || "";
+  const senderEmail = process.env.SENDER_EMAIL || "";
+  if (!apiKey || !senderEmail) {
+    console.log(`[UYARI] BREVO_API_KEY veya SENDER_EMAIL eksik! Kod: ${code}`);
+    return false;
+  }
+  try {
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sender: { name: "Leylek", email: senderEmail },
+        to: [{ email: toEmail }],
+        subject: "Leylek Dogrulama Kodunuz",
+        htmlContent: `<div style="font-family:sans-serif;padding:20px;">
+          <h2>Leylek E-Posta Dogrulama</h2>
+          <p>Hesabinizi dogrulamak icin asagidaki 6 haneli kodu uygulamaya girin:</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:6px;margin:20px 0;color:#0D9488;">${code}</div>
+          <p>Bu kod 15 dakika boyunca gecerlidir.</p>
+        </div>`,
+      }),
+    });
+    if (!res.ok) {
+      console.error("Brevo mail hatasi:", await res.text());
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("Mail gonderim hatasi:", err.message);
+    return false;
+  }
+}
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -26,10 +67,13 @@ async function initDb() {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user',
       banned INTEGER NOT NULL DEFAULT 0,
-      email_verified BOOLEAN NOT NULL DEFAULT TRUE,
+      email_verified BOOLEAN NOT NULL DEFAULT FALSE,
       verification_code TEXT,
+      code_expires_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS code_expires_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS tours (
       id SERIAL PRIMARY KEY,
@@ -58,7 +102,6 @@ async function initDb() {
       "INSERT INTO users (name, email, password_hash, role, email_verified) VALUES ($1, $2, $3, 'admin', TRUE)",
       ["Leylek Admin", ADMIN_EMAIL, hash]
     );
-    console.log("Varsayilan admin olusturuldu:", ADMIN_EMAIL);
   }
 }
 
@@ -80,7 +123,7 @@ function adminOnly(req, res, next) {
 }
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", service: "Leylek API", version: "1.0.0" });
+  res.json({ status: "ok", service: "Leylek API", email_verification: "brevo-active" });
 });
 
 app.post("/api/auth/register", async (req, res) => {
@@ -90,13 +133,25 @@ app.post("/api/auth/register", async (req, res) => {
     const cleanEmail = email.trim().toLowerCase();
     const safeRole = role === "seller" ? "seller" : "user";
     const hash = await bcrypt.hash(password, 10);
+    const code = generateCode();
+
     const result = await pool.query(
-      "INSERT INTO users (name, email, password_hash, role, email_verified) VALUES ($1, $2, $3, $4, TRUE) RETURNING id, name, email, role, email_verified",
-      [name.trim(), cleanEmail, hash, safeRole]
+      `INSERT INTO users (name, email, password_hash, role, email_verified, verification_code, code_expires_at)
+       VALUES ($1, $2, $3, $4, FALSE, $5, NOW() + INTERVAL '15 minutes')
+       RETURNING id, name, email, role, email_verified`,
+      [name.trim(), cleanEmail, hash, safeRole, code]
     );
+
     const user = result.rows[0];
+    const emailSent = await sendVerificationEmail(cleanEmail, code);
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user, verification_required: false, email_sent: false });
+
+    res.json({
+      token,
+      user,
+      verification_required: true,
+      email_sent: emailSent,
+    });
   } catch (err) {
     if (err.code === "23505") return res.status(400).json({ error: "Bu e-posta zaten kayitli" });
     res.status(500).json({ error: err.message });
@@ -111,23 +166,86 @@ app.post("/api/auth/login", async (req, res) => {
     const row = result.rows[0];
     if (!row) return res.status(401).json({ error: "E-posta veya sifre hatali" });
     if (row.banned) return res.status(403).json({ error: "Hesabiniz askiya alinmistir" });
+
     const valid = await bcrypt.compare(password || "", row.password_hash);
     if (!valid) return res.status(401).json({ error: "E-posta veya sifre hatali" });
-    const user = { id: row.id, name: row.name, email: row.email, role: row.role, email_verified: row.email_verified };
+
+    let emailSent = false;
+    if (!row.email_verified) {
+      const code = generateCode();
+      await pool.query(
+        "UPDATE users SET verification_code = $1, code_expires_at = NOW() + INTERVAL '15 minutes' WHERE id = $2",
+        [code, row.id]
+      );
+      emailSent = await sendVerificationEmail(row.email, code);
+    }
+
+    const user = {
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: row.role,
+      email_verified: Boolean(row.email_verified),
+    };
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user, verification_required: false });
+
+    res.json({
+      token,
+      user,
+      verification_required: !row.email_verified,
+      email_sent: emailSent,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post("/api/auth/verify-email", authMiddleware, async (req, res) => {
-  await pool.query("UPDATE users SET email_verified = TRUE WHERE id = $1", [req.user.id]);
-  res.json({ success: true, message: "E-posta dogrulandi" });
+  try {
+    const inputCode = String(req.body.code || "").trim();
+    if (!inputCode) return res.status(400).json({ error: "Dogrulama kodunu girin" });
+
+    const result = await pool.query("SELECT verification_code, code_expires_at FROM users WHERE id = $1", [req.user.id]);
+    const row = result.rows[0];
+    if (!row || !row.verification_code) {
+      return res.status(400).json({ error: "Aktif dogrulama kodu bulunamadi, yeni kod isteyin" });
+    }
+    if (row.code_expires_at && new Date(row.code_expires_at) < new Date()) {
+      return res.status(400).json({ error: "Kodun suresi doldu, yeni kod isteyin" });
+    }
+    if (row.verification_code !== inputCode) {
+      return res.status(400).json({ error: "Dogrulama kodu hatali" });
+    }
+
+    await pool.query(
+      "UPDATE users SET email_verified = TRUE, verification_code = NULL, code_expires_at = NULL WHERE id = $1",
+      [req.user.id]
+    );
+    res.json({ success: true, message: "E-posta basariyla dogrulandi" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/auth/resend-code", authMiddleware, (_req, res) => {
-  res.json({ success: true, message: "Dogrulama kodu gonderildi" });
+app.post("/api/auth/resend-code", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT email, email_verified FROM users WHERE id = $1", [req.user.id]);
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ error: "Kullanici bulunamadi" });
+    if (row.email_verified) return res.json({ success: true, message: "E-posta zaten dogrulanmis" });
+
+    const code = generateCode();
+    await pool.query(
+      "UPDATE users SET verification_code = $1, code_expires_at = NOW() + INTERVAL '15 minutes' WHERE id = $2",
+      [code, req.user.id]
+    );
+    const sent = await sendVerificationEmail(row.email, code);
+    if (!sent) return res.status(500).json({ error: "E-posta gonderilemedi, sunucu mail ayarini kontrol edin" });
+
+    res.json({ success: true, message: "Yeni dogrulama kodu e-postaniza gonderildi" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/api/tours", async (_req, res) => {
